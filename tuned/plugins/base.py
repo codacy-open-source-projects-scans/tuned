@@ -213,6 +213,14 @@ class Plugin(object):
 	def _instance_post_static(self, instance, enabling):
 		pass
 
+	def _safe_script_path(self, path):
+		path = os.path.realpath(path)
+		profile_paths = self._global_cfg.get_list(consts.CFG_PROFILE_DIRS, consts.CFG_DEF_PROFILE_DIRS)
+		for p in profile_paths:
+			if path.startswith(p):
+				return True
+		return False
+
 	def _call_device_script(self, instance, script, op, devices, rollback = consts.ROLLBACK_SOFT):
 		if script is None:
 			return None
@@ -222,6 +230,10 @@ class Plugin(object):
 		if not script.startswith("/"):
 			log.error("Relative paths cannot be used in script_pre or script_post. " \
 				+ "Use ${i:PROFILE_DIR}.")
+			return False
+		if not self._safe_script_path(script):
+			log.error("Paths outside of the profile directories cannot be used in the " \
+				+ "script_pre or script_post, ignoring script: '%s'" % script)
 			return False
 		dir_name = os.path.dirname(script)
 		ret = True
@@ -460,7 +472,7 @@ class Plugin(object):
 	def _verify_all_device_commands(self, instance, devices, ignore_missing):
 		ret = True
 		for command in [command for command in list(self._commands.values()) if command["per_device"]]:
-			new_value = instance.options.get(command["name"], None)
+			new_value = self._variables.expand(instance.options.get(command["name"], None))
 			if new_value is None:
 				continue
 			for device in devices:
