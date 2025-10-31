@@ -1,0 +1,6 @@
+*.pyc
+*.pyo
+tuned-*.tar.bz2
+*~
+*.html
+doc/manual/modules/performance/ref_available-tuned-plug-ins.adoc
