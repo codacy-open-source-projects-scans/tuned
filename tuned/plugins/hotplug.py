@@ -13,8 +13,8 @@ class Plugin(base.Plugin):
 		super(Plugin, self).__init__(*args, **kwargs)
 
 	def cleanup(self):
-		super(Plugin, self).cleanup()
 		self._hardware_events_cleanup()
+		super(Plugin, self).cleanup()
 
 	def _hardware_events_init(self):
 		pass
@@ -27,11 +27,14 @@ class Plugin(base.Plugin):
 
 	def _hardware_events_callback(self, event, device):
 		if event == "add":
-			log.info("device '%s' added" % device.sys_name)
+			log.info("device '%s', add event" % device.sys_name)
 			self._add_device(device.sys_name)
 		elif event == "remove":
-			log.info("device '%s' removed" % device.sys_name)
+			log.info("device '%s', remove event" % device.sys_name)
 			self._remove_device(device.sys_name)
+		elif event == "move":
+			log.info("device: '%s', rename event, reported new name" % device.sys_name)
+			self._move_device(device.sys_name)
 
 	def _add_device_process(self, instance, device_name):
 		log.info("instance %s: adding new device %s" % (instance.name, device_name))
@@ -43,6 +46,7 @@ class Plugin(base.Plugin):
 
 	def _add_device(self, device_name):
 		if device_name in (self._assigned_devices | self._free_devices):
+			log.debug("device: '%s' already exists, ignoring" % device_name)
 			return
 
 		for instance_name, instance in list(self._instances.items()):
@@ -78,6 +82,19 @@ class Plugin(base.Plugin):
 			return True
 		return False
 
+	def _move_device(self, device_name):
+		"""Rename device in the instance, this probably applies only
+		to network interfaces. The udev device environment is
+		mostly unchanged (except the name) and the old device name
+		isn't announced, thus the rename functionality is plugin
+		dependant and has to be implemented in the child plugin class.
+
+		Parameters:
+		device_name -- new name of the device
+
+		"""
+		pass
+
 	def _remove_device(self, device_name):
 		"""Remove device from the instance
 
@@ -86,13 +103,17 @@ class Plugin(base.Plugin):
 
 		"""
 		if device_name not in (self._assigned_devices | self._free_devices):
+			log.debug("device: '%s' doesn't exist, ignoring" % device_name)
 			return
 
 		for instance in list(self._instances.values()):
 			if self._remove_device_process(instance, device_name):
 				break
 		else:
-			self._free_devices.remove(device_name)
+			try:
+				self._free_devices.remove(device_name)
+			except KeyError:
+				log.debug("device: '%s' isn't initialized, not removing it" % device_name)
 
 	def _remove_devices_nocheck(self, instance, device_names):
 		"""

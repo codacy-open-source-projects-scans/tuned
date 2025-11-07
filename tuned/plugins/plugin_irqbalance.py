@@ -3,7 +3,6 @@ from .decorators import command_custom
 from tuned import consts
 import tuned.logs
 import errno
-import perf
 import re
 
 log = tuned.logs.get()
@@ -29,7 +28,7 @@ class IrqbalancePlugin(base.Plugin):
 
 	def __init__(self, *args, **kwargs):
 		super(IrqbalancePlugin, self).__init__(*args, **kwargs)
-		self._cpus = perf.cpu_map()
+		self._cpus = self._cmd.get_cpus()
 
 	def _instance_init(self, instance):
 		instance._has_dynamic_tuning = False
@@ -101,7 +100,7 @@ class IrqbalancePlugin(base.Plugin):
 			self._restart_irqbalance()
 
 	@command_custom("banned_cpus", per_device=False)
-	def _banned_cpus(self, enabling, value, verify, ignore_missing):
+	def _banned_cpus(self, enabling, value, verify, ignore_missing, instance):
 		banned_cpulist_string = None
 		if value is not None:
 			banned = set(self._cmd.cpulist_unpack(value))

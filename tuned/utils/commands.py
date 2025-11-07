@@ -280,7 +280,7 @@ class commands:
 	def is_cpu_online(self, cpu):
 		scpu = str(cpu)
 		# CPU0 is always online
-		return cpu == "0" or self.read_file("/sys/devices/system/cpu/cpu%s/online" % scpu, no_error = True).strip() == "1"
+		return cpu == "0" or self.read_file("/sys/devices/system/cpu/cpu%s/online" % scpu, err_ret = "1", no_error = True).strip() == "1"
 
 	# Converts hexadecimal CPU mask to CPU list
 	def hex2cpulist(self, mask):
@@ -552,3 +552,12 @@ class commands:
 	# Checks if name contains only valid characters and has valid length or is empty string or None
 	def is_valid_name(self, name):
 		return not name or (all(c in consts.NAMES_ALLOWED_CHARS for c in name) and len(name) <= consts.NAMES_MAX_LENGTH)
+
+	def getconf(self, variable):
+		return check_output(["getconf", variable]).decode().strip()
+
+	# Gets list of available CPUs
+	def get_cpus(self):
+		cpus = self.read_file(consts.SYSFS_CPUS_PRESENT_PATH)
+		# fallback to single core CPU if sysfs is unavailable
+		return self.cpulist_unpack(cpus) if cpus else [ 0 ]

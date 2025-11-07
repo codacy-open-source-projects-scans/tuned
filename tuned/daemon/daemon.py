@@ -51,6 +51,8 @@ class Daemon(object):
 			self._init_profile(profile_names)
 		except TunedException as e:
 			log.error("Cannot set initial profile. No tunings will be enabled: %s" % e)
+			if not self._daemon:
+				raise TunedException("Applying TuneD profile failed, check TuneD logs for details.")
 
 	def _init_threads(self):
 		self._thread = None
@@ -291,12 +293,12 @@ class Daemon(object):
 
 	def get_all_plugins(self):
 		"""Return all accessible plugin classes"""
-		return self._unit_manager.plugins_repository.load_all_plugins()
+		return self._unit_manager.plugins_repository.load_all_classes()
 
 	def get_plugin_documentation(self, plugin_name):
 		"""Return plugin class docstring"""
 		try:
-			plugin_class = self._unit_manager.plugins_repository.load_plugin(
+			plugin_class = self._unit_manager.plugins_repository.load_class(
 				plugin_name
 			)
 		except ImportError:
@@ -313,7 +315,7 @@ class Daemon(object):
 		dictionary -- {parameter_name: hint}
 		"""
 		try:
-			plugin_class = self._unit_manager.plugins_repository.load_plugin(
+			plugin_class = self._unit_manager.plugins_repository.load_class(
 				plugin_name
 			)
 		except ImportError:

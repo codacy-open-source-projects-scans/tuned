@@ -8,7 +8,12 @@ import tuned.logs
 import re
 from subprocess import *
 import threading
-import perf
+# perf is optional
+try:
+	import perf
+except ImportError:
+# if perf is unavailable, it will be disabled later
+	pass
 import select
 import tuned.consts as consts
 import procfs
@@ -215,7 +220,7 @@ class SchedulerPlugin(base.Plugin):
 	To adjust scheduling policy, priority and affinity for a group of
 	processes/threads, use the following syntax.
 
-	[subs="+quotes,+macros"]
+	[subs="quotes"]
 	----
 	group.__groupname__=__rule_prio__:__sched__:__prio__:__affinity__:__regex__
 	----
@@ -227,7 +232,7 @@ class SchedulerPlugin(base.Plugin):
 	defined. However, this is Python interpreter dependant. To disable
 	an inherited rule for `__groupname__` use:
 
-	[subs="+quotes,+macros"]
+	[subs="quotes"]
 	----
 	group.__groupname__=
 	----
@@ -245,7 +250,7 @@ class SchedulerPlugin(base.Plugin):
 
 	`__regex__` is Python regular expression. It is matched against the output of:
 
-	[subs="+quotes,+macros"]
+	[subs="quotes"]
 	----
 	ps -eo cmd
 	----
@@ -401,7 +406,7 @@ class SchedulerPlugin(base.Plugin):
 	with hierarchy-ID 8 and controller-list blkio.
 	====
 
-	Recent kernels moved some `sched_` and `numa_balancing_` kernel run-time
+	Kernels 5.13 and newer moved some `sched_` and `numa_balancing_` kernel run-time
 	parameters from `/proc/sys/kernel`, managed by the `sysctl` utility, to
 	`debugfs`, typically mounted under `/sys/kernel/debug`.  TuneD provides an
 	abstraction mechanism for the following parameters via the scheduler plug-in:
@@ -412,8 +417,12 @@ class SchedulerPlugin(base.Plugin):
 	[option]`numa_balancing_scan_period_min_ms`,
 	[option]`numa_balancing_scan_period_max_ms` and
 	[option]`numa_balancing_scan_size_mb`.
-	Based on the kernel used, TuneD will write the specified value to the correct
-	location.
+	Moreover in kernel 6.6 and newer support for the `sched_wakeup_granularity_ns` and
+	`sched_latency_ns` were removed. The `sched_min_granularity_ns` was renamed to
+	`sched_base_slice_ns`. Based on the kernel used, TuneD will write the specified
+	value to the correct location or ignore it. For the compatibility the alias
+	[option]`sched_base_slice_ns` was added, but the [option]`sched_min_granularity_ns`
+	can be still used instead.
 
 	.Set tasks' "cache hot" value for migration decisions.
 	====
@@ -432,6 +441,17 @@ class SchedulerPlugin(base.Plugin):
 	====
 	"""
 
+	_dict_sched_knob_map = {
+		"wakeup_granularity_ns": "",
+		"min_granularity_ns": "base_slice_ns",
+		"latency_ns": "",
+	}
+
+	def _disable_perf(self):
+		log.warning("python-perf unavailable, disabling perf support and " \
+			"runtime tuning, you can try to (re)install python(3)-perf package")
+		self._perf_available = False
+
 	def __init__(self, monitor_repository, storage_factory, hardware_inventory, device_matcher, device_matcher_udev, plugin_instance_factory, global_cfg, variables):
 		super(SchedulerPlugin, self).__init__(monitor_repository, storage_factory, hardware_inventory, device_matcher, device_matcher_udev, plugin_instance_factory, global_cfg, variables)
 		self._has_dynamic_options = True
@@ -448,8 +468,18 @@ class SchedulerPlugin(base.Plugin):
 		# default is to whitelist all and blacklist none
 		self._ps_whitelist = ".*"
 		self._ps_blacklist = ""
+		self._kthread_process = True
 		self._cgroup_ps_blacklist_re = ""
-		self._cpus = perf.cpu_map()
+		self._perf_available = True
+
+		try:
+			self._cpus = perf.cpu_map()
+		except (NameError, AttributeError):
+			self._disable_perf()
+			# it's different type than perf.cpu_map(), but without perf we use it as iterable
+			# which should be compatible
+			self._cpus = self._cmd.get_cpus()
+
 		self._scheduler_storage_key = self._storage_key(
 				command_name = "scheduler")
 		self._irq_process = True
@@ -517,7 +547,7 @@ class SchedulerPlugin(base.Plugin):
 		if self._cmd.get_bool(instance._scheduler.get("runtime", 1)) == "0":
 			instance._runtime_tuning = False
 		instance._terminate = threading.Event()
-		if self._daemon and instance._runtime_tuning:
+		if self._daemon and instance._runtime_tuning and self._perf_available:
 			try:
 				instance._threads = perf.thread_map()
 				evsel = perf.evsel(type = perf.TYPE_SOFTWARE,
@@ -534,7 +564,9 @@ class SchedulerPlugin(base.Plugin):
 					instance._evlist.mmap(pages = perf_mmap_pages)
 			# no perf
 			except:
-				instance._runtime_tuning = False
+				self._disable_perf()
+		if not self._perf_available:
+			instance._runtime_tuning = False
 
 	def _instance_cleanup(self, instance):
 		if instance._evlist:
@@ -552,11 +584,13 @@ class SchedulerPlugin(base.Plugin):
 			"cgroup_ps_blacklist": None,
 			"ps_whitelist": None,
 			"ps_blacklist": None,
+			"kthread_process": True,
 			"irq_process": True,
 			"default_irq_smp_affinity": "calc",
 			"perf_mmap_pages": None,
 			"perf_process_fork": "false",
 			"sched_min_granularity_ns": None,
+			"sched_base_slice_ns": None,
 			"sched_latency_ns": None,
 			"sched_wakeup_granularity_ns": None,
 			"sched_tunable_scaling": None,
@@ -588,6 +622,8 @@ class SchedulerPlugin(base.Plugin):
 		processes = {}
 		for proc in ps.values():
 			try:
+				if not self._kthread_process and self._is_kthread(proc):
+					continue
 				cmd = self._get_cmdline(proc)
 				pid = proc["pid"]
 				processes[pid] = cmd
@@ -646,13 +682,22 @@ class SchedulerPlugin(base.Plugin):
 	def _is_kthread(self, process):
 		return process["stat"]["flags"] & procfs.pidstat.PF_KTHREAD != 0
 
+	def _process_in_blacklisted_cgroup(self, process):
+		if self._cgroup_ps_blacklist_re == "":
+			return False
+		return re.search(self._cgroup_ps_blacklist_re, self._get_stat_cgroup(process)) is not None
+
 	# Returns True if we can ignore a failed affinity change of
 	# a process with the given PID and therefore not report it as an error.
-	def _ignore_set_affinity_error(self, pid):
+	def _ignore_set_affinity_error(self, process):
+		pid = process.pid
 		try:
-			process = procfs.process(pid)
 			if process["stat"]["state"] == "Z":
 				log.debug("Affinity of zombie task with PID %d could not be changed."
+						% pid)
+				return True
+			if self._process_in_blacklisted_cgroup(process):
+				log.debug("Affinity of task with PID %d could not be changed, the task was moved into a blacklisted cgroup."
 						% pid)
 				return True
 			if process["stat"].is_bound_to_cpu():
@@ -663,6 +708,9 @@ class SchedulerPlugin(base.Plugin):
 					log.warning("Affinity of task with PID %d cannot be changed, the task's affinity mask is fixed."
 							% pid)
 				return True
+			log.info("Task %d cmdline: %s" % (pid, self._get_cmdline(process)))
+			log.info("Task %d cgroup: %s" % (pid, self._get_stat_cgroup(process)))
+			log.info("Task %d affinity: %s" % (pid, list(self._scheduler_utils.get_affinity(pid))))
 		except (OSError, IOError) as e:
 			if e.errno == errno.ENOENT or e.errno == errno.ESRCH:
 				log.debug("Failed to get task info for PID %d, the task vanished."
@@ -1055,6 +1103,9 @@ class SchedulerPlugin(base.Plugin):
 
 	def _add_pid(self, instance, pid, r):
 		try:
+			proc = procfs.process(pid)
+			if not self._kthread_process and self._is_kthread(proc):
+				return
 			cmd = self._get_cmdline(pid)
 		except (OSError, IOError) as e:
 			if e.errno == errno.ENOENT \
@@ -1110,7 +1161,7 @@ class SchedulerPlugin(base.Plugin):
 								self._remove_pid(instance, int(event.tid))
 
 	@command_custom("cgroup_ps_blacklist", per_device = False)
-	def _cgroup_ps_blacklist(self, enabling, value, verify, ignore_missing):
+	def _cgroup_ps_blacklist(self, enabling, value, verify, ignore_missing, instance):
 		# currently unsupported
 		if verify:
 			return None
@@ -1118,7 +1169,7 @@ class SchedulerPlugin(base.Plugin):
 			self._cgroup_ps_blacklist_re = "|".join(["(%s)" % v for v in re.split(r"(?<!\\);", str(value))])
 
 	@command_custom("ps_whitelist", per_device = False)
-	def _ps_whitelist(self, enabling, value, verify, ignore_missing):
+	def _ps_whitelist(self, enabling, value, verify, ignore_missing, instance):
 		# currently unsupported
 		if verify:
 			return None
@@ -1126,15 +1177,23 @@ class SchedulerPlugin(base.Plugin):
 			self._ps_whitelist = "|".join(["(%s)" % v for v in re.split(r"(?<!\\);", str(value))])
 
 	@command_custom("ps_blacklist", per_device = False)
-	def _ps_blacklist(self, enabling, value, verify, ignore_missing):
+	def _ps_blacklist(self, enabling, value, verify, ignore_missing, instance):
 		# currently unsupported
 		if verify:
 			return None
 		if enabling and value is not None:
 			self._ps_blacklist = "|".join(["(%s)" % v for v in re.split(r"(?<!\\);", str(value))])
 
+	@command_custom("kthread_process", per_device = False)
+	def _kthread_process(self, enabling, value, verify, ignore_missing, instance):
+		# currently unsupported
+		if verify:
+			return None
+		if enabling and value is not None:
+			self._kthread_process = self._cmd.get_bool(value) == "1"
+
 	@command_custom("irq_process", per_device = False)
-	def _irq_process(self, enabling, value, verify, ignore_missing):
+	def _irq_process(self, enabling, value, verify, ignore_missing, instance):
 		# currently unsupported
 		if verify:
 			return None
@@ -1142,7 +1201,7 @@ class SchedulerPlugin(base.Plugin):
 			self._irq_process = self._cmd.get_bool(value) == "1"
 
 	@command_custom("default_irq_smp_affinity", per_device = False)
-	def _default_irq_smp_affinity(self, enabling, value, verify, ignore_missing):
+	def _default_irq_smp_affinity(self, enabling, value, verify, ignore_missing, instance):
 		# currently unsupported
 		if verify:
 			return None
@@ -1153,7 +1212,7 @@ class SchedulerPlugin(base.Plugin):
 				self._default_irq_smp_affinity_value = self._cmd.cpulist_unpack(value)
 
 	@command_custom("perf_process_fork", per_device = False)
-	def _perf_process_fork(self, enabling, value, verify, ignore_missing):
+	def _perf_process_fork(self, enabling, value, verify, ignore_missing, instance):
 		# currently unsupported
 		if verify:
 			return None
@@ -1170,13 +1229,17 @@ class SchedulerPlugin(base.Plugin):
 		return res
 
 	def _set_affinity(self, pid, affinity):
+		process = procfs.process(pid)
+		if self._process_in_blacklisted_cgroup(process):
+			log.debug("Not setting CPU affinity of PID %d, the task belongs to a blacklisted cgroup." % pid)
+			return
 		log.debug("Setting CPU affinity of PID %d to '%s'." % (pid, affinity))
 		try:
 			self._scheduler_utils.set_affinity(pid, affinity)
 		# Workaround for old python-schedutils (pre-0.4) which
 		# incorrectly raised SystemError instead of OSError
 		except (SystemError, OSError) as e:
-			if not self._ignore_set_affinity_error(pid):
+			if not self._ignore_set_affinity_error(process):
 				log.error("Failed to set affinity of PID %d to '%s': %s"
 						% (pid, affinity, e))
 
@@ -1188,14 +1251,14 @@ class SchedulerPlugin(base.Plugin):
 		return affinity3
 
 	def _set_all_obj_affinity(self, objs, affinity, threads = False):
-		psl = [v for v in objs if re.search(self._ps_whitelist,
+		psl = objs
+		if not self._kthread_process:
+			psl = [v for v in psl if not self._is_kthread(v)]
+		psl = [v for v in psl if re.search(self._ps_whitelist,
 				self._get_stat_comm(v)) is not None]
 		if self._ps_blacklist != "":
 			psl = [v for v in psl if re.search(self._ps_blacklist,
 					self._get_stat_comm(v)) is None]
-		if self._cgroup_ps_blacklist_re != "":
-			psl = [v for v in psl if re.search(self._cgroup_ps_blacklist_re,
-					self._get_stat_cgroup(v)) is None]
 		psd = dict([(v.pid, v) for v in psl])
 		for pid in psd:
 			try:
@@ -1365,7 +1428,7 @@ class SchedulerPlugin(base.Plugin):
 		return res
 
 	@command_custom("isolated_cores", per_device = False, priority = 10)
-	def _isolated_cores(self, enabling, value, verify, ignore_missing):
+	def _isolated_cores(self, enabling, value, verify, ignore_missing, instance):
 		affinity = None
 		self._affinity = None
 		if value is not None:
@@ -1399,118 +1462,152 @@ class SchedulerPlugin(base.Plugin):
 			# _instance_unapply_static()
 			if self._irq_process:
 				self._restore_all_irq_affinity()
+		return True
+
+	def _sched_assembly_path(self, prefix, namespace, knob):
+		if prefix == "":
+			path = "%s/%s" % (namespace, knob)
+		else:
+			path = "%s/%s/%s" % (prefix, namespace, knob)
+		return "/sys/kernel/debug/%s" % path
+
+	# map to kernel 6.6 paths, "" means that knob was dropped
+	def _sched_assembly_path2(self, path, prefix, namespace, knob):
+		lpath = path
+		if namespace == "sched":
+			lknob = self._dict_sched_knob_map.get(knob)
+			if lknob is not None:
+				if lknob:
+					lpath = self._sched_assembly_path(prefix, namespace, lknob)
+				else:
+					lpath = ""
+		return lpath
 
 	def _get_sched_knob_path(self, prefix, namespace, knob):
 		key = "%s_%s_%s" % (prefix, namespace, knob)
 		path = self._sched_knob_paths_cache.get(key)
-		if path:
+		if path or path == "":
 			return path
 		path = "/proc/sys/kernel/%s_%s" % (namespace, knob)
 		if not os.path.exists(path):
-			if prefix == "":
-				path = "%s/%s" % (namespace, knob)
-			else:
-				path = "%s/%s/%s" % (prefix, namespace, knob)
-			path = "/sys/kernel/debug/%s" % path
-			if self._secure_boot_hint is None:
+			path = self._sched_assembly_path(prefix, namespace, knob)
+			# kernel 6.6 drops and renames some knobs
+			if not os.path.exists(path):
+				path = self._sched_assembly_path2(path, prefix, namespace, knob)
+			if path != "" and self._secure_boot_hint is None:
 				self._secure_boot_hint = True
 		self._sched_knob_paths_cache[key] = path
 		return path
 
 	def _get_sched_knob(self, prefix, namespace, knob):
-		data = self._cmd.read_file(self._get_sched_knob_path(prefix, namespace, knob), err_ret = None)
-		if data is None:
-			log.error("Error reading '%s'" % knob)
-			if self._secure_boot_hint:
-				log.error("This may not work with Secure Boot or kernel_lockdown (this hint is logged only once)")
-				self._secure_boot_hint = False
+		data = None
+		path = self._get_sched_knob_path(prefix, namespace, knob)
+		if path != "":
+			data = self._cmd.read_file(path, err_ret = None)
+			if data is None:
+				log.error("Error reading '%s'" % knob)
+				if self._secure_boot_hint:
+					log.error("This may not work with Secure Boot or kernel_lockdown (this hint is logged only once)")
+					self._secure_boot_hint = False
 		return data
 
 	def _set_sched_knob(self, prefix, namespace, knob, value, sim, remove = False):
 		if value is None:
 			return None
+		path = self._get_sched_knob_path(prefix, namespace, knob)
+		if not path:
+			log.debug("knob '%s' ignored, unsupported by kernel" % knob)
+			return None
 		if not sim:
-			if not self._cmd.write_to_file(self._get_sched_knob_path(prefix, namespace, knob), value, \
+			if not self._cmd.write_to_file(path, value, \
 				no_error = [errno.ENOENT] if remove else False):
 					log.error("Error writing value '%s' to '%s'" % (value, knob))
 		return value
 
 	@command_get("sched_min_granularity_ns")
-	def _get_sched_min_granularity_ns(self):
+	def _get_sched_min_granularity_ns(self, instance):
 		return self._get_sched_knob("", "sched", "min_granularity_ns")
 
 	@command_set("sched_min_granularity_ns")
-	def _set_sched_min_granularity_ns(self, value, sim, remove):
+	def _set_sched_min_granularity_ns(self, value, instance, sim, remove):
 		return self._set_sched_knob("", "sched", "min_granularity_ns", value, sim, remove)
 
+	@command_get("sched_base_slice_ns")
+	def _get_sched_base_slice_ns(self, instance):
+		return self._get_sched_min_granularity_ns(instance)
+
+	@command_set("sched_base_slice_ns")
+	def _set_sched_base_slice_ns(self, value, instance, sim, remove):
+		return self._set_sched_min_granularity_ns(value, instance, sim, remove)
+
 	@command_get("sched_latency_ns")
-	def _get_sched_latency_ns(self):
+	def _get_sched_latency_ns(self, instance):
 		return self._get_sched_knob("", "sched", "latency_ns")
 
 	@command_set("sched_latency_ns")
-	def _set_sched_latency_ns(self, value, sim, remove):
+	def _set_sched_latency_ns(self, value, instance, sim, remove):
 		return self._set_sched_knob("", "sched", "latency_ns", value, sim, remove)
 
 	@command_get("sched_wakeup_granularity_ns")
-	def _get_sched_wakeup_granularity_ns(self):
+	def _get_sched_wakeup_granularity_ns(self, instance):
 		return self._get_sched_knob("", "sched", "wakeup_granularity_ns")
 
 	@command_set("sched_wakeup_granularity_ns")
-	def _set_sched_wakeup_granularity_ns(self, value, sim, remove):
+	def _set_sched_wakeup_granularity_ns(self, value, instance, sim, remove):
 		return self._set_sched_knob("", "sched", "wakeup_granularity_ns", value, sim, remove)
 
 	@command_get("sched_tunable_scaling")
-	def _get_sched_tunable_scaling(self):
+	def _get_sched_tunable_scaling(self, instance):
 		return self._get_sched_knob("", "sched", "tunable_scaling")
 
 	@command_set("sched_tunable_scaling")
-	def _set_sched_tunable_scaling(self, value, sim, remove):
+	def _set_sched_tunable_scaling(self, value, instance, sim, remove):
 		return self._set_sched_knob("", "sched", "tunable_scaling", value, sim, remove)
 
 	@command_get("sched_migration_cost_ns")
-	def _get_sched_migration_cost_ns(self):
+	def _get_sched_migration_cost_ns(self, instance):
 		return self._get_sched_knob("", "sched", "migration_cost_ns")
 
 	@command_set("sched_migration_cost_ns")
-	def _set_sched_migration_cost_ns(self, value, sim, remove):
+	def _set_sched_migration_cost_ns(self, value, instance, sim, remove):
 		return self._set_sched_knob("", "sched", "migration_cost_ns", value, sim, remove)
 
 	@command_get("sched_nr_migrate")
-	def _get_sched_nr_migrate(self):
+	def _get_sched_nr_migrate(self, instance):
 		return self._get_sched_knob("", "sched", "nr_migrate")
 
 	@command_set("sched_nr_migrate")
-	def _set_sched_nr_migrate(self, value, sim, remove):
+	def _set_sched_nr_migrate(self, value, instance, sim, remove):
 		return self._set_sched_knob("", "sched", "nr_migrate", value, sim, remove)
 
 	@command_get("numa_balancing_scan_delay_ms")
-	def _get_numa_balancing_scan_delay_ms(self):
+	def _get_numa_balancing_scan_delay_ms(self, instance):
 		return self._get_sched_knob("sched", "numa_balancing", "scan_delay_ms")
 
 	@command_set("numa_balancing_scan_delay_ms")
-	def _set_numa_balancing_scan_delay_ms(self, value, sim, remove):
+	def _set_numa_balancing_scan_delay_ms(self, value, instance, sim, remove):
 		return self._set_sched_knob("sched", "numa_balancing", "scan_delay_ms", value, sim, remove)
 
 	@command_get("numa_balancing_scan_period_min_ms")
-	def _get_numa_balancing_scan_period_min_ms(self):
+	def _get_numa_balancing_scan_period_min_ms(self, instance):
 		return self._get_sched_knob("sched", "numa_balancing", "scan_period_min_ms")
 
 	@command_set("numa_balancing_scan_period_min_ms")
-	def _set_numa_balancing_scan_period_min_ms(self, value, sim, remove):
+	def _set_numa_balancing_scan_period_min_ms(self, value, instance, sim, remove):
 		return self._set_sched_knob("sched", "numa_balancing", "scan_period_min_ms", value, sim, remove)
 
 	@command_get("numa_balancing_scan_period_max_ms")
-	def _get_numa_balancing_scan_period_max_ms(self):
+	def _get_numa_balancing_scan_period_max_ms(self, instance):
 		return self._get_sched_knob("sched", "numa_balancing", "scan_period_max_ms")
 
 	@command_set("numa_balancing_scan_period_max_ms")
-	def _set_numa_balancing_scan_period_max_ms(self, value, sim, remove):
+	def _set_numa_balancing_scan_period_max_ms(self, value, instance, sim, remove):
 		return self._set_sched_knob("sched", "numa_balancing", "scan_period_max_ms", value, sim, remove)
 
 	@command_get("numa_balancing_scan_size_mb")
-	def _get_numa_balancing_scan_size_mb(self):
+	def _get_numa_balancing_scan_size_mb(self, instance):
 		return self._get_sched_knob("sched", "numa_balancing", "scan_size_mb")
 
 	@command_set("numa_balancing_scan_size_mb")
-	def _set_numa_balancing_scan_size_mb(self, value, sim, remove):
+	def _set_numa_balancing_scan_size_mb(self, value, instance, sim, remove):
 		return self._set_sched_knob("sched", "numa_balancing", "scan_size_mb", value, sim, remove)

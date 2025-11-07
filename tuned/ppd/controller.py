@@ -3,7 +3,8 @@ from tuned.utils.commands import commands
 from tuned.consts import PPD_CONFIG_FILE, PPD_BASE_PROFILE_FILE, PPD_API_COMPATIBILITY
 from tuned.ppd.config import PPDConfig, PPD_PERFORMANCE, PPD_BALANCED, PPD_POWER_SAVER
 
-from enum import StrEnum
+from enum import Enum
+from random import Random
 import pyinotify
 import threading
 import dbus
@@ -29,7 +30,7 @@ PLATFORM_PROFILE_MAPPING = {
 }
 
 
-class PerformanceDegraded(StrEnum):
+class PerformanceDegraded(Enum):
     """
     Possible reasons for performance degradation.
     """
@@ -103,10 +104,11 @@ class ProfileHold(object):
     Class holding information about a single profile hold,
     i.e., a temporary profile switch requested by a process.
     """
-    def __init__(self, profile, reason, app_id, watch):
+    def __init__(self, profile, reason, app_id, caller, watch):
         self.profile = profile
         self.reason = reason
         self.app_id = app_id
+        self.caller = caller
         self.watch = watch
 
     def as_dict(self):
@@ -128,7 +130,7 @@ class ProfileHoldManager(object):
     """
     def __init__(self, controller):
         self._holds = {}
-        self._cookie_counter = 0
+        self._cookie_generator = Random()
         self._controller = controller
 
     def _removal_callback(self, cookie, app_id):
@@ -173,13 +175,14 @@ class ProfileHoldManager(object):
         """
         Adds a new profile hold.
         """
-        cookie = self._cookie_counter
-        self._cookie_counter += 1
+        cookie = 0
+        while cookie == 0 or cookie in self._holds:
+            cookie = self._cookie_generator.randint(0, 2**32-1)
         watch = self._controller.bus.watch_name_owner(caller, self._removal_callback(cookie, app_id))
         log.info("Adding hold '%s': profile '%s' by application '%s'" % (cookie, profile, app_id))
-        self._holds[cookie] = ProfileHold(profile, reason, app_id, watch)
+        self._holds[cookie] = ProfileHold(profile, reason, app_id, caller, watch)
         exports.property_changed("ActiveProfileHolds", self.as_dbus_array())
-        self._controller.switch_profile(profile)
+        self._controller.switch_profile(self._effective_hold_profile())
         return cookie
 
     def has(self, cookie):
@@ -207,6 +210,9 @@ class ProfileHoldManager(object):
         for cookie in list(self._holds.keys()):
             self._cancel(cookie)
 
+    def check_caller(self, cookie, caller):
+        return cookie in self._holds and self._holds[cookie].caller == caller
+
 
 class Controller(exports.interfaces.ExportableInterface):
     """
@@ -223,6 +229,7 @@ class Controller(exports.interfaces.ExportableInterface):
         self._watch_manager = pyinotify.WatchManager()
         self._notifier = pyinotify.ThreadedNotifier(self._watch_manager)
         self._inotify_watches = {}
+        self._pinned_virtual_files = []
         self._platform_profile_supported = os.path.isfile(PLATFORM_PROFILE_PATH)
         self._no_turbo_supported = os.path.isfile(NO_TURBO_PATH)
         self._lap_mode_supported = os.path.isfile(LAP_MODE_PATH)
@@ -243,7 +250,9 @@ class Controller(exports.interfaces.ExportableInterface):
         """
         if not result:
             return
-        self._profile_holds.clear()
+        if tuned_profile != self._tuned_interface.active_profile():
+            log.debug("Received a profile change signal from TuneD, but it is not relevant anymore.")
+            return
         try:
             ppd_profile = self._config.tuned_to_ppd.get(tuned_profile, self._on_battery)
         except KeyError:
@@ -251,6 +260,7 @@ class Controller(exports.interfaces.ExportableInterface):
             log.warning("TuneD profile changed to an unknown profile '%s'" % tuned_profile)
         if self._active_profile != ppd_profile:
             log.info("Profile changed to '%s'" % ppd_profile)
+            self._profile_holds.clear()
             self._active_profile = ppd_profile
             exports.property_changed("ActiveProfile", self._active_profile)
             if ppd_profile != UNKNOWN_PROFILE:
@@ -280,19 +290,25 @@ class Controller(exports.interfaces.ExportableInterface):
         """
         Sets up inotify file watches.
         """
+        for f in self._pinned_virtual_files:
+            f.close()
+        self._pinned_virtual_files.clear()
         self._watch_manager.rm_watch(list(self._inotify_watches.values()))
         if self._no_turbo_supported:
+            self._pinned_virtual_files.append(open(NO_TURBO_PATH, "r"))
             self._inotify_watches |= self._watch_manager.add_watch(path=os.path.dirname(NO_TURBO_PATH),
                                                                    mask=pyinotify.IN_MODIFY,
-                                                                   proc_fun=PerformanceDegradedEventHandler(NO_TURBO_PATH, self))
+                                                                   proc_fun=PerformanceDegradedEventHandler(self, NO_TURBO_PATH))
         if self._lap_mode_supported:
+            self._pinned_virtual_files.append(open(LAP_MODE_PATH, "r"))
             self._inotify_watches |= self._watch_manager.add_watch(path=os.path.dirname(LAP_MODE_PATH),
                                                                    mask=pyinotify.IN_MODIFY,
-                                                                   proc_fun=PerformanceDegradedEventHandler(LAP_MODE_PATH, self))
-        if self._platform_profile_supported and self._config.thinkpad_function_keys:
-           self._inotify_watches |= self._watch_manager.add_watch(path=os.path.dirname(PLATFORM_PROFILE_PATH),
-                                                                  mask=pyinotify.IN_OPEN | pyinotify.IN_MODIFY | pyinotify.IN_CLOSE_WRITE | pyinotify.IN_CLOSE_NOWRITE,
-                                                                  proc_fun=PlatformProfileEventHandler(self))
+                                                                   proc_fun=PerformanceDegradedEventHandler(self, LAP_MODE_PATH))
+        if self._platform_profile_supported and self._config.sysfs_acpi_monitor:
+            self._pinned_virtual_files.append(open(PLATFORM_PROFILE_PATH, "r"))
+            self._inotify_watches |= self._watch_manager.add_watch(path=os.path.dirname(PLATFORM_PROFILE_PATH),
+                                                                   mask=pyinotify.IN_OPEN | pyinotify.IN_MODIFY | pyinotify.IN_CLOSE_WRITE | pyinotify.IN_CLOSE_NOWRITE,
+                                                                   proc_fun=PlatformProfileEventHandler(self))
 
     def check_performance_degraded(self):
         """
@@ -304,9 +320,9 @@ class Controller(exports.interfaces.ExportableInterface):
         if os.path.exists(LAP_MODE_PATH) and self._cmd.read_file(LAP_MODE_PATH).strip() == "1":
             performance_degraded = PerformanceDegraded.LAP_DETECTED
         if performance_degraded != self._performance_degraded:
-            log.info("Performance degraded: %s" % performance_degraded)
+            log.info("Performance degraded: %s" % performance_degraded.value)
             self._performance_degraded = performance_degraded
-            exports.property_changed("PerformanceDegraded", performance_degraded)
+            exports.property_changed("PerformanceDegraded", performance_degraded.value)
 
     def check_platform_profile(self):
         """
@@ -370,6 +386,9 @@ class Controller(exports.interfaces.ExportableInterface):
         self._notifier.start()
         while not self._cmd.wait(self._terminate, 1):
             pass
+        for f in self._pinned_virtual_files:
+            f.close()
+        self._pinned_virtual_files.clear()
         self._watch_manager.rm_watch(list(self._inotify_watches.values()))
         self._notifier.stop()
         exports.stop()
@@ -408,7 +427,7 @@ class Controller(exports.interfaces.ExportableInterface):
             self._active_profile = profile
         return True
 
-    @exports.export("sss", "u")
+    @exports.export("sss", "u", "hold-profile")
     def HoldProfile(self, profile, reason, app_id, caller):
         """
         Initiates a profile hold and returns a cookie for referring to it.
@@ -419,13 +438,15 @@ class Controller(exports.interfaces.ExportableInterface):
             )
         return self._profile_holds.add(profile, reason, app_id, caller)
 
-    @exports.export("u", "")
+    @exports.export("u", "", "release-profile")
     def ReleaseProfile(self, cookie, caller):
         """
         Releases a held profile with the given cookie.
         """
         if not self._profile_holds.has(cookie):
             raise dbus.exceptions.DBusException("No active hold for cookie '%s'" % cookie)
+        if not self._profile_holds.check_caller(cookie, caller):
+            raise dbus.exceptions.DBusException("Cannot release a profile hold inititated by another process.")
         self._profile_holds.remove(cookie)
 
     @exports.signal("u")
@@ -435,8 +456,8 @@ class Controller(exports.interfaces.ExportableInterface):
         """
         pass
 
-    @exports.property_setter("ActiveProfile")
-    def set_active_profile(self, profile):
+    @exports.property_setter("ActiveProfile", "switch-profile")
+    def set_active_profile(self, profile, caller):
         """
         Sets the base profile to the given one and also makes it active.
         If there are any active profile holds, these are cancelled.
@@ -451,14 +472,14 @@ class Controller(exports.interfaces.ExportableInterface):
         self._save_base_profile(profile)
 
     @exports.property_getter("ActiveProfile")
-    def get_active_profile(self):
+    def get_active_profile(self, caller):
         """
         Returns the currently active PPD profile.
         """
         return self._active_profile
 
     @exports.property_getter("Profiles")
-    def get_profiles(self):
+    def get_profiles(self, caller):
         """
         Returns a DBus array of all available PPD profiles.
         """
@@ -468,26 +489,26 @@ class Controller(exports.interfaces.ExportableInterface):
         )
 
     @exports.property_getter("Actions")
-    def get_actions(self):
+    def get_actions(self, caller):
         """
         Returns a DBus array of all available actions (currently there are none).
         """
         return dbus.Array([], signature="s")
 
     @exports.property_getter("PerformanceDegraded")
-    def get_performance_degraded(self):
+    def get_performance_degraded(self, caller):
         """
         Returns the current performance degradation status.
         """
-        return self._performance_degraded
+        return self._performance_degraded.value
 
     @exports.property_getter("ActiveProfileHolds")
-    def get_active_profile_holds(self):
+    def get_active_profile_holds(self, caller):
         """
         Returns a DBus array of active profile holds.
         """
         return self._profile_holds.as_dbus_array()
 
     @exports.property_getter("Version")
-    def version(self):
+    def version(self, caller):
         return PPD_API_COMPATIBILITY

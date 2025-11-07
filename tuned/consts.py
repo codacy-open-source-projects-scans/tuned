@@ -21,6 +21,7 @@ USER_PROFILES_DIR = "/etc/tuned/profiles"
 SYSTEM_PROFILES_DIR = "/usr/lib/tuned/profiles"
 PERSISTENT_STORAGE_DIR = "/var/lib/tuned"
 PLUGIN_MAIN_UNIT_NAME = "main"
+PLUGIN_VARIABLES_UNIT_NAME = "variables"
 # Magic section header because ConfigParser does not support "headerless" config
 MAGIC_HEADER_NAME = "this_is_some_magic_section_header_because_of_compatibility"
 RECOMMEND_DIRECTORIES = ["/usr/lib/tuned/recommend.d", "/etc/tuned/recommend.d"]
@@ -43,7 +44,6 @@ GRUB2_DEFAULT_ENV_FILE = "/etc/default/grub"
 INITRD_IMAGE_DIR = "/boot"
 BOOT_CMDLINE_TUNED_VAR = "TUNED_BOOT_CMDLINE"
 BOOT_CMDLINE_INITRD_ADD_VAR = "TUNED_BOOT_INITRD_ADD"
-BOOT_CMDLINE_KARGS_DELETED_VAR = "TUNED_BOOT_KARGS_DELETED"
 BOOT_CMDLINE_FILE = "/etc/tuned/bootcmdline"
 PETITBOOT_DETECT_DIR = "/sys/firmware/opal"
 MACHINE_ID_FILE = "/etc/machine-id"
@@ -77,6 +77,9 @@ ACPI_DIR = "/sys/firmware/acpi"
 # built-in functions configuration
 SYSFS_CPUS_PATH = "/sys/devices/system/cpu"
 
+# present CPUs
+SYSFS_CPUS_PRESENT_PATH = "%s/present" % SYSFS_CPUS_PATH
+
 # number of backups
 LOG_FILE_COUNT = 2
 LOG_FILE_MAXBYTES = 100*1000
@@ -97,13 +100,25 @@ PREFIX_PROFILE_FACTORY = "System"
 PREFIX_PROFILE_USER = "User"
 
 # PPD-to-tuned API translation daemon configuration
-PPD_NAMESPACE = "net.hadess.PowerProfiles"
-PPD_DBUS_BUS = PPD_NAMESPACE
-PPD_DBUS_OBJECT = "/net/hadess/PowerProfiles"
-PPD_DBUS_INTERFACE = PPD_DBUS_BUS
 PPD_CONFIG_FILE = "/etc/tuned/ppd.conf"
 PPD_BASE_PROFILE_FILE = "/etc/tuned/ppd_base_profile"
 PPD_API_COMPATIBILITY = "0.23"
+PPD_DBUS_BUS = "org.freedesktop.UPower.PowerProfiles"
+PPD_DBUS_BUS_LEGACY = "net.hadess.PowerProfiles"
+PPD_DBUS_NAMES = [
+	{
+		"bus": PPD_DBUS_BUS,
+		"namespace": PPD_DBUS_BUS,
+		"interface": PPD_DBUS_BUS,
+		"object": "/org/freedesktop/UPower/PowerProfiles"
+	},
+	{
+		"bus": PPD_DBUS_BUS_LEGACY,
+		"namespace": PPD_DBUS_BUS_LEGACY,
+		"interface": PPD_DBUS_BUS_LEGACY,
+		"object": "/net/hadess/PowerProfiles"
+	}
+]
 
 # After adding new option to tuned-main.conf add here its name with CFG_ prefix
 # and eventually default value with CFG_DEF_ prefix (default is None)
@@ -131,6 +146,7 @@ CFG_UNIX_SOCKET_CONNECTIONS_BACKLOG = "connections_backlog"
 CFG_CPU_EPP_FLAG = "hwp_epp"
 CFG_ROLLBACK = "rollback"
 CFG_PROFILE_DIRS = "profile_dirs"
+CFG_STARTUP_UDEV_SETTLE_WAIT = "startup_udev_settle_wait"
 
 # no_daemon mode
 CFG_DEF_DAEMON = True
@@ -182,6 +198,8 @@ CFG_FUNC_UNIX_SOCKET_CONNECTIONS_BACKLOG = "getint"
 CFG_DEF_ROLLBACK = "auto"
 # default profile directories
 CFG_DEF_PROFILE_DIRS = [SYSTEM_PROFILES_DIR, USER_PROFILES_DIR]
+# default startup udev settle wait
+CFG_DEF_STARTUP_UDEV_SETTLE_WAIT = 0
 
 PATH_CPU_DMA_LATENCY = "/dev/cpu_dma_latency"
 

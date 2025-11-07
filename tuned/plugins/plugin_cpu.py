@@ -190,7 +190,9 @@ class CPULatencyPlugin(hotplug.Plugin):
 
 	`boost`:::
 	The [option]`boost` option allows the CPU to boost above nominal
-	frequencies for shorts periods of time.
+	frequencies for shorts periods of time. On Intel systems with the
+	intel_pstate driver, setting boost=0 will automatically set no_turbo=1
+	to ensure boost is properly disabled.
 	+
 	.Allowing CPU boost
 	====
@@ -526,7 +528,7 @@ class CPULatencyPlugin(hotplug.Plugin):
 		return self._cmd.read_file("/sys/devices/system/cpu/%s/cpufreq/scaling_available_governors" % device).strip().split()
 
 	@command_set("governor", per_device=True)
-	def _set_governor(self, governors, device, sim, remove):
+	def _set_governor(self, governors, device, instance, sim, remove):
 		if not self._check_cpu_can_change_governor(device):
 			return None
 		governors = str(governors)
@@ -555,7 +557,7 @@ class CPULatencyPlugin(hotplug.Plugin):
 		return governor
 
 	@command_get("governor")
-	def _get_governor(self, device, ignore_missing=False):
+	def _get_governor(self, device, instance, ignore_missing=False):
 		governor = None
 		if not self._check_cpu_can_change_governor(device):
 			return None
@@ -572,7 +574,7 @@ class CPULatencyPlugin(hotplug.Plugin):
 		return "/sys/devices/system/cpu/cpufreq/%s/sampling_down_factor" % governor
 
 	@command_set("sampling_down_factor", per_device = True, priority = 10)
-	def _set_sampling_down_factor(self, sampling_down_factor, device, sim, remove):
+	def _set_sampling_down_factor(self, sampling_down_factor, device, instance, sim, remove):
 		val = None
 
 		# hack to clear governors map when the profile starts unloading
@@ -582,7 +584,7 @@ class CPULatencyPlugin(hotplug.Plugin):
 			self._governors_map.clear()
 
 		self._governors_map[device] = None
-		governor = self._get_governor(device)
+		governor = self._get_governor(device, instance)
 		if governor is None:
 			log.debug("ignoring sampling_down_factor setting for CPU '%s', cannot match governor" % device)
 			return None
@@ -599,8 +601,8 @@ class CPULatencyPlugin(hotplug.Plugin):
 		return val
 
 	@command_get("sampling_down_factor")
-	def _get_sampling_down_factor(self, device, ignore_missing=False):
-		governor = self._get_governor(device, ignore_missing=ignore_missing)
+	def _get_sampling_down_factor(self, device, instance, ignore_missing=False):
+		governor = self._get_governor(device, instance, ignore_missing=ignore_missing)
 		if governor is None:
 			return None
 		path = self._sampling_down_factor_path(governor)
@@ -627,7 +629,7 @@ class CPULatencyPlugin(hotplug.Plugin):
 		return "/sys/devices/system/cpu/cpu%s/power/energy_perf_bias" % cpu_id
 
 	@command_set("energy_perf_bias", per_device=True)
-	def _set_energy_perf_bias(self, energy_perf_bias, device, sim, remove):
+	def _set_energy_perf_bias(self, energy_perf_bias, device, instance, sim, remove):
 		if not self._is_cpu_online(device):
 			log.debug("%s is not online, skipping" % device)
 			return None
@@ -706,7 +708,7 @@ class CPULatencyPlugin(hotplug.Plugin):
 				}.get(self._try_parse_num(s), s)
 
 	@command_get("energy_perf_bias")
-	def _get_energy_perf_bias(self, device, ignore_missing=False):
+	def _get_energy_perf_bias(self, device, instance, ignore_missing=False):
 		energy_perf_bias = None
 		if not self._is_cpu_online(device):
 			log.debug("%s is not online, skipping" % device)
@@ -741,7 +743,7 @@ class CPULatencyPlugin(hotplug.Plugin):
 		return self._has_pm_qos_resume_latency_us
 
 	@command_set("pm_qos_resume_latency_us", per_device=True)
-	def _set_pm_qos_resume_latency_us(self, pm_qos_resume_latency_us, device, sim, remove):
+	def _set_pm_qos_resume_latency_us(self, pm_qos_resume_latency_us, device, instance, sim, remove):
 		if not self._is_cpu_online(device):
 			log.debug("%s is not online, skipping" % device)
 			return None
@@ -757,7 +759,7 @@ class CPULatencyPlugin(hotplug.Plugin):
 		return latency
 
 	@command_get("pm_qos_resume_latency_us")
-	def _get_pm_qos_resume_latency_us(self, device, ignore_missing=False):
+	def _get_pm_qos_resume_latency_us(self, device, instance, ignore_missing=False):
 		if not self._is_cpu_online(device):
 			log.debug("%s is not online, skipping" % device)
 			return None
@@ -766,26 +768,47 @@ class CPULatencyPlugin(hotplug.Plugin):
 		return self._cmd.read_file(self._pm_qos_resume_latency_us_path(device), no_error=ignore_missing).strip()
 
 	@command_set("boost", per_device=True)
-	def _set_boost(self, boost, device, sim, remove):
+	def _set_boost(self, boost, device, instance, sim, remove):
 		if not self._is_cpu_online(device):
 			log.debug("%s is not online, skipping" % device)
 			return None
 		cpu_id = device.lstrip("cpu")
+		boost_set = False
+
 		if os.path.exists(self._pstate_boost_path(cpu_id)):
 			if not sim:
 				if boost == "0" or boost == "1":
 					self._cmd.write_to_file(self._pstate_boost_path(cpu_id), boost, \
 						no_error = [errno.ENOENT] if remove else False, ignore_same=True)
 					log.info("Setting boost value '%s' for cpu '%s'" % (boost, device))
+					boost_set = True
 				else:
 					log.error("Failed to set boost on cpu '%s'. Is the value in the profile correct?" % device)
-			return str(boost)
 		else:
 			log.debug("boost file missing, which can happen on pre 6.11 kernels.")
+
+		# For Intel systems with intel_pstate driver, handle no_turbo
+		# This ensures boost=0 works properly on Intel CPUs
+		if self._has_intel_pstate and boost in ["0", "1"]:
+			no_turbo_val = "1" if boost == "0" else "0"
+
+			if not sim:
+				try:
+					self._set_intel_pstate_attr("no_turbo", no_turbo_val)
+					log.info("Setting no_turbo to '%s' for intel_pstate driver (boost=%s)" % (no_turbo_val, boost))
+					boost_set = True
+				except Exception as e:
+					log.warning("Failed to set no_turbo for intel_pstate: %s" % str(e))
+
+		if boost_set or sim:
+			return str(boost)
+		elif boost in ["0", "1"]:
+			log.warning("Unable to set boost on cpu '%s'. Neither per-policy boost nor intel_pstate no_turbo is available." % device)
+
 		return None
 
 	@command_get("boost")
-	def _get_boost(self, device, ignore_missing=False):
+	def _get_boost(self, device, instance, ignore_missing=False):
 		if not self._is_cpu_online(device):
 			log.debug("%s is not online, skipping" % device)
 			return None
@@ -797,7 +820,7 @@ class CPULatencyPlugin(hotplug.Plugin):
 		return None
 
 	@command_set("energy_performance_preference", per_device=True)
-	def _set_energy_performance_preference(self, energy_performance_preference, device, sim, remove):
+	def _set_energy_performance_preference(self, energy_performance_preference, device, instance, sim, remove):
 		if not self._is_cpu_online(device):
 			log.debug("%s is not online, skipping" % device)
 			return None
@@ -807,7 +830,13 @@ class CPULatencyPlugin(hotplug.Plugin):
 			if not sim:
 				avail_vals = set(self._cmd.read_file(self._pstate_preference_path(cpu_id, True)).split())
 				for val in vals:
-					if val in avail_vals:
+					try:
+						val = int(val)
+						valid = 0 <= val < 256
+						val = str(val)
+					except ValueError:
+						valid = val in avail_vals
+					if valid:
 						self._cmd.write_to_file(self._pstate_preference_path(cpu_id), val, \
 							no_error = [errno.ENOENT] if remove else False, ignore_same=True)
 						log.info("Setting energy_performance_preference value '%s' for cpu '%s'" % (val, device))
@@ -823,7 +852,7 @@ class CPULatencyPlugin(hotplug.Plugin):
 		return None
 
 	@command_get("energy_performance_preference")
-	def _get_energy_performance_preference(self, device, ignore_missing=False):
+	def _get_energy_performance_preference(self, device, instance, ignore_missing=False):
 		if not self._is_cpu_online(device):
 			log.debug("%s is not online, skipping" % device)
 			return None
